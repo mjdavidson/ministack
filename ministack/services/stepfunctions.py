@@ -22,6 +22,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -41,6 +42,24 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("states")
+
+# Scale factor for Wait state durations and retry intervals.
+# 0 = skip all waits, 0.01 = 1% of normal, 1 = normal (default).
+# Set via SFN_WAIT_SCALE environment variable.
+
+def _parse_wait_scale():
+    raw = os.environ.get("SFN_WAIT_SCALE", "1")
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        logger.warning("Invalid SFN_WAIT_SCALE=%r, using default 1.0", raw)
+        return 1.0
+    if not math.isfinite(val):
+        logger.warning("Invalid SFN_WAIT_SCALE=%r, using default 1.0", raw)
+        return 1.0
+    return max(val, 0)
+
+_SFN_WAIT_SCALE = _parse_wait_scale()
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
@@ -1198,7 +1217,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 interval = retrier.get("IntervalSeconds", 1)
                 backoff = retrier.get("BackoffRate", 2.0)
                 sleep_sec = interval * (backoff ** count)
-                time.sleep(min(sleep_sec, 60))
+                _scaled_sleep(min(sleep_sec, 60))
                 retry_counts[retrier_idx] = count + 1
                 continue
             break
@@ -1265,7 +1284,7 @@ def _invoke_activity(resource, input_data):
         "input": json.dumps(input_data),
     })
 
-    timeout = 99999
+    timeout = _scaled_timeout(99999)
     if not evt.wait(timeout=timeout):
         _task_tokens.pop(token, None)
         raise _ExecutionError("States.Timeout", "Activity task timed out waiting for worker")
@@ -1300,7 +1319,7 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         except _ExecutionError:
             pass
 
-    timeout = state_def.get("TimeoutSeconds", 99999)
+    timeout = _scaled_timeout(state_def.get("TimeoutSeconds", 99999))
     if not evt.wait(timeout=timeout):
         _task_tokens.pop(token, None)
         raise _ExecutionError("States.Timeout",
@@ -1457,13 +1476,13 @@ def _execute_wait(state_def, raw_input):
     effective = _apply_input_path(state_def, raw_input)
 
     if "Seconds" in state_def:
-        time.sleep(state_def["Seconds"])
+        _scaled_sleep(state_def["Seconds"])
     elif "Timestamp" in state_def:
         _sleep_until(state_def["Timestamp"])
     elif "SecondsPath" in state_def:
         secs = _resolve_path(state_def["SecondsPath"], effective)
         if isinstance(secs, (int, float)) and secs > 0:
-            time.sleep(secs)
+            _scaled_sleep(secs)
     elif "TimestampPath" in state_def:
         ts_str = _resolve_path(state_def["TimestampPath"], effective)
         if isinstance(ts_str, str):
@@ -1473,12 +1492,26 @@ def _execute_wait(state_def, raw_input):
     return output, _next_or_end(state_def)
 
 
+def _scaled_sleep(seconds):
+    scaled = seconds * _SFN_WAIT_SCALE
+    if scaled > 0:
+        time.sleep(scaled)
+
+
+def _scaled_timeout(seconds):
+    """Scale a blocking-wait timeout.  Returns at least 0.01 so Event.wait()
+    never blocks forever when scale is 0."""
+    if _SFN_WAIT_SCALE == 0:
+        return 0.01
+    return max(seconds * _SFN_WAIT_SCALE, 0.01)
+
+
 def _sleep_until(iso_ts):
     try:
         target = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         delta = (target - datetime.now(timezone.utc)).total_seconds()
         if delta > 0:
-            time.sleep(delta)
+            _scaled_sleep(delta)
     except (ValueError, TypeError):
         pass
 
@@ -1725,7 +1758,15 @@ def _parse_intrinsic_args(s, pos):
             arg, pos = _parse_intrinsic_call(s, pos)
             args.append(arg)
         elif ch == "'":
-            end = s.index("'", pos + 1)
+            # Scan for closing quote, handling \' escapes.
+            end = pos + 1
+            while end < len(s):
+                if s[end] == '\\' and end + 1 < len(s):
+                    end += 2
+                elif s[end] == "'":
+                    break
+                else:
+                    end += 1
             args.append(("str", s[pos + 1 : end]))
             pos = end + 1
         elif ch == "$":
@@ -1812,15 +1853,27 @@ def _exec_intrinsic(node, data, ctx):
         merged.update(args[1])
         return merged
     elif name == "States.Format":
+        # AWS States.Format: \' → ', \{ → {, \} → }, \\ → \ in
+        # template segments only.  Interpolated values are verbatim.
         template = args[0]
-        parts = template.split("{}")
-        result_parts = []
-        for i, part in enumerate(parts):
-            result_parts.append(part)
-            if i < len(parts) - 1 and i < len(args) - 1:
-                val = args[i + 1]
-                result_parts.append(str(val) if not isinstance(val, str) else val)
-        return "".join(result_parts)
+        arg_idx = 1
+        out: list[str] = []
+        i = 0
+        while i < len(template):
+            ch = template[i]
+            if ch == '\\' and i + 1 < len(template):
+                out.append(template[i + 1])
+                i += 2
+            elif ch == '{' and i + 1 < len(template) and template[i + 1] == '}':
+                if arg_idx < len(args):
+                    val = args[arg_idx]
+                    out.append(str(val) if not isinstance(val, str) else val)
+                    arg_idx += 1
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
     elif name == "States.ArrayGetItem":
         return args[0][int(args[1])]
     elif name == "States.Array":
@@ -2132,7 +2185,7 @@ def _poll_ecs_tasks(cluster, task_arns):
     from ministack.services import ecs
 
     for _ in range(600):
-        time.sleep(1)
+        _scaled_sleep(1)
         status, _, body = ecs._describe_tasks({"cluster": cluster, "tasks": task_arns})
         result = json.loads(body) if body else {}
         tasks = result.get("tasks", [])

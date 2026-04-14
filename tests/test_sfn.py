@@ -334,6 +334,39 @@ def test_sfn_intrinsic_format(sfn, sfn_sync):
     output = json.loads(resp["output"])
     assert output["greeting"] == "Hello Jay from SF"
 
+def test_sfn_intrinsic_format_escapes(sfn, sfn_sync):
+    """States.Format handles \\' \\{ \\} \\\\ escapes in template only."""
+    definition = json.dumps({
+        "StartAt": "Fmt",
+        "States": {
+            "Fmt": {
+                "Type": "Pass",
+                "Parameters": {
+                    "quoted.$": "States.Format('it\\'s {}', $.x)",
+                    "braces.$": "States.Format('\\{literal\\}')",
+                    "backslash.$": "States.Format('C:\\\\tmp')",
+                    "preserved.$": "States.Format('path: {}', $.path)",
+                },
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-intrinsic-fmt-esc",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"x": "fine", "path": "C:\\tmp\\file"}),
+    )
+    assert resp["status"] == "SUCCEEDED"
+    output = json.loads(resp["output"])
+    assert output["quoted"] == "it's fine"
+    assert output["braces"] == "{literal}"
+    assert output["backslash"] == "C:\\tmp"
+    assert output["preserved"] == "path: C:\\tmp\\file"
+
 def test_sfn_intrinsic_nested(sfn, sfn_sync):
     """Nested intrinsic: States.StringToJson(States.Format(...))"""
     definition = json.dumps({
@@ -2569,3 +2602,64 @@ def test_sfn_aws_sdk_error_prefix_in_failed_execution(sfn, sfn_sync):
     assert resp.get("error", "").startswith("Rds."), f"Expected Rds. prefix, got: {resp.get('error', '')}"
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+def test_sfn_wait_scale_zero_skips_wait(sfn):
+    """SFN_WAIT_SCALE=0 skips Wait state sleeps entirely.
+
+    Uses /_ministack/config to set the scale on the running server,
+    then starts an async execution with a 60s Wait that should complete
+    almost instantly. Marked serial via conftest._SERIAL_TESTS because
+    it mutates server-global state.
+    """
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def _set_wait_scale(val):
+        req = urllib.request.Request(
+            f"{endpoint}/_ministack/config",
+            data=json.dumps({"stepfunctions._SFN_WAIT_SCALE": val}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+
+    _set_wait_scale(0)
+    try:
+        definition = json.dumps({
+            "StartAt": "LongWait",
+            "States": {
+                "LongWait": {
+                    "Type": "Wait",
+                    "Seconds": 60,
+                    "Next": "Done",
+                },
+                "Done": {"Type": "Pass", "Result": "ok", "End": True},
+            },
+        })
+        sm = sfn.create_state_machine(
+            name="qa-sfn-wait-scale",
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )
+        sm_arn = sm["stateMachineArn"]
+
+        t0 = time.time()
+        exec_resp = sfn.start_execution(stateMachineArn=sm_arn, input="{}")
+        exec_arn = exec_resp["executionArn"]
+
+        # Poll until complete (should be near-instant with scale=0).
+        for _ in range(30):
+            desc = sfn.describe_execution(executionArn=exec_arn)
+            if desc["status"] != "RUNNING":
+                break
+            time.sleep(0.2)
+        elapsed = time.time() - t0
+
+        assert desc["status"] == "SUCCEEDED", f"Expected SUCCEEDED, got {desc['status']}"
+        assert json.loads(desc["output"]) == "ok"
+        assert elapsed < 5, f"Expected < 5s with scale=0, took {elapsed:.1f}s"
+
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
+    finally:
+        _set_wait_scale(1.0)

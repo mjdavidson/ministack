@@ -225,8 +225,12 @@ def _resolve_cluster(resource_arn):
     return cluster, engine
 
 
-def _get_secret_password(secret_arn):
-    """Extract password from a Secrets Manager secret."""
+def _get_secret_credentials(secret_arn):
+    """Extract username and password from a Secrets Manager secret.
+
+    Returns (username, password) where username may be None if the secret
+    doesn't contain one.
+    """
     from ministack.services import secretsmanager
 
     for _name, secret in secretsmanager._secrets.items():
@@ -238,27 +242,34 @@ def _get_secret_password(secret_arn):
                     if secret_string:
                         try:
                             parsed = json.loads(secret_string)
-                            return parsed.get("password", secret_string)
+                            return (parsed.get("username"),
+                                    parsed.get("password", secret_string))
                         except (json.JSONDecodeError, TypeError):
-                            return secret_string
+                            return None, secret_string
             # Fallback to any version
             for _vid, ver in secret.get("Versions", {}).items():
                 secret_string = ver.get("SecretString")
                 if secret_string:
                     try:
                         parsed = json.loads(secret_string)
-                        return parsed.get("password", secret_string)
+                        return (parsed.get("username"),
+                                parsed.get("password", secret_string))
                     except (json.JSONDecodeError, TypeError):
-                        return secret_string
-    return None
+                        return None, secret_string
+    return None, None
 
 
-def _connect(instance, engine, database=None, password=None):
+def _connect(instance, engine, database=None, password=None,
+             username=None):
     """Create a database connection to the real container."""
-    host = instance.get("Endpoint", {}).get("Address", "localhost")
-    port = instance.get("Endpoint", {}).get("Port", 5432)
-    user = instance.get("MasterUsername", "admin")
-    db = database or instance.get("DBName", "")
+    # Prefer the internal (Docker-network) address when available so the
+    # Data API can reach sibling containers.  Fall back to the public
+    # endpoint for host-mode or non-Docker setups.
+    host = (instance.get("_internal_address")
+            or instance.get("Endpoint", {}).get("Address", "localhost"))
+    port = (instance.get("_internal_port")
+            or instance.get("Endpoint", {}).get("Port", 5432))
+    db = database or ""
     pw = password or "password"
 
     if "mysql" in engine or "aurora-mysql" in engine or "mariadb" in engine:
@@ -269,8 +280,16 @@ def _connect(instance, engine, database=None, password=None):
                 "pymysql is required for MySQL/Aurora MySQL rds-data support. "
                 "Install with: pip install pymysql"
             )
+        # In Docker MySQL, 'root' has full privileges. Map the master
+        # user (or absent username) to root. Non-master usernames pass
+        # through for user-level operations.
+        master = instance.get("MasterUsername", "admin")
+        if not username or username == master:
+            connect_user = "root"
+        else:
+            connect_user = username
         return pymysql.connect(
-            host=host, port=int(port), user=user,
+            host=host, port=int(port), user=connect_user,
             password=pw, database=db or None, autocommit=True,
         )
     else:
@@ -281,8 +300,9 @@ def _connect(instance, engine, database=None, password=None):
                 "psycopg2 is required for PostgreSQL/Aurora PostgreSQL rds-data support. "
                 "Install with: pip install psycopg2-binary"
             )
+        pg_user = username or instance.get("MasterUsername", "admin")
         return psycopg2.connect(
-            host=host, port=int(port), user=user,
+            host=host, port=int(port), user=pg_user,
             password=pw, dbname=db or "postgres",
         )
 
@@ -407,7 +427,7 @@ def _execute_statement(data):
         logger.info("No endpoint for %s, using stub mode", resource_arn)
         return _stub_execute(resource_arn, sql)
 
-    password = _get_secret_password(secret_arn)
+    secret_user, password = _get_secret_credentials(secret_arn)
 
     # Convert :name placeholders to %(name)s for DB-API
     params = _convert_parameters(parameters)
@@ -423,7 +443,8 @@ def _execute_statement(data):
             if txn_id and txn_id in _transactions:
                 conn = _transactions[txn_id]["conn"]
             else:
-                conn = _connect(instance, engine, database, password)
+                conn = _connect(instance, engine, database, password,
+                                username=secret_user)
                 own_conn = True
 
         cursor = conn.cursor()
@@ -457,7 +478,9 @@ def _execute_statement(data):
     except ImportError as e:
         if own_conn and conn:
             conn.close()
-        logger.warning("DB driver not available, using stub: %s", e)
+        if not getattr(_execute_statement, "_import_warned", False):
+            logger.warning("DB driver not available, using stub: %s", e)
+            _execute_statement._import_warned = True
         return _stub_execute(resource_arn, sql)
     except Exception as e:
         if own_conn and conn:
@@ -488,10 +511,11 @@ def _begin_transaction(data):
         return _error("BadRequestException",
                        f"Database cluster not found for ARN: {resource_arn}")
 
-    password = _get_secret_password(secret_arn)
+    secret_user, password = _get_secret_credentials(secret_arn)
 
     try:
-        conn = _connect(instance, engine, database, password)
+        conn = _connect(instance, engine, database, password,
+                        username=secret_user)
         if "mysql" in engine or "aurora-mysql" in engine:
             conn.autocommit(False)
         else:
@@ -573,7 +597,7 @@ def _batch_execute_statement(data):
         return _error("BadRequestException",
                        f"Database cluster not found for ARN: {resource_arn}")
 
-    password = _get_secret_password(secret_arn)
+    secret_user, password = _get_secret_credentials(secret_arn)
 
     own_conn = False
     conn = None
@@ -582,7 +606,8 @@ def _batch_execute_statement(data):
             if txn_id and txn_id in _transactions:
                 conn = _transactions[txn_id]["conn"]
             else:
-                conn = _connect(instance, engine, database, password)
+                conn = _connect(instance, engine, database, password,
+                                username=secret_user)
                 own_conn = True
 
         cursor = conn.cursor()
